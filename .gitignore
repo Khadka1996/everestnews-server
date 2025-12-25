@@ -47,9 +47,6 @@ dump.rdb
 ehthumbs.db
 Thumbs.db
 
-# Uploads directory (if you don't want to track uploaded files)
-uploads/
-!uploads/.gitkeep
 
 # Temporary files
 tmp/
