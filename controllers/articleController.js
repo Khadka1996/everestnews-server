@@ -6,11 +6,11 @@ const { createClient } = require('redis');
 const mongoose = require('mongoose');
 const ObjectId = mongoose.Types.ObjectId;
 
-// Initialize Redis client with connection URL
+// Initialize Redis client ONLY for 2 endpoints
 const redisClient = createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379',
   socket: {
-    connectTimeout: 10000, // Set connection timeout to 10 seconds
+    connectTimeout: 5000, // Reduced timeout
   }
 });
 
@@ -23,14 +23,6 @@ redisClient.on('connect', () => {
   console.log('Connected to Redis successfully');
 });
 
-redisClient.on('ready', () => {
-  console.log('Redis client is ready');
-});
-
-redisClient.on('reconnecting', () => {
-  console.log('Redis client is reconnecting...');
-});
-
 // Connect to Redis
 (async () => {
   try {
@@ -41,25 +33,21 @@ redisClient.on('reconnecting', () => {
   }
 })();
 
-// Helper function to clear article-related caches
-const clearArticleCaches = async (articleId = null) => {
+// Helper function to clear ONLY the 2 cached endpoints
+const clearSelectiveCaches = async () => {
   try {
-    const keys = await redisClient.keys('articles:*');
-    if (keys.length > 0) {
-      await redisClient.del(keys);
-      console.log('Cleared article caches');
+    // Clear only getAllArticles caches (all pages and variations)
+    const articleKeys = await redisClient.keys('articles:all:*');
+    if (articleKeys.length > 0) {
+      await redisClient.del(articleKeys);
+      console.log(`Cleared ${articleKeys.length} getAllArticles caches`);
     }
     
     // Clear trending articles cache
     await redisClient.del('trending_articles');
     
-    // If specific article ID is provided, clear its cache
-    if (articleId) {
-      await redisClient.del(`article:${articleId}`);
-      await redisClient.del(`article_full:${articleId}`);
-    }
   } catch (err) {
-    console.error('Error clearing caches:', err);
+    console.error('Error clearing selective caches:', err);
   }
 };
 
@@ -122,8 +110,12 @@ const createArticle = async (req, res) => {
 
     const savedArticle = await newArticle.save();
     
-    // Clear caches after creating new article
-    await clearArticleCaches();
+    // Clear ONLY the 2 selective caches (in background, don't wait)
+    if (redisClient.isReady) {
+      clearSelectiveCaches().catch(err => {
+        console.error('Background cache clearing failed:', err);
+      });
+    }
     
     res.status(201).json({ success: true, data: savedArticle });
 
@@ -173,8 +165,12 @@ const updateArticle = async (req, res) => {
     // Update the article in the database with the new data
     const updatedArticle = await Article.findByIdAndUpdate(req.params.id, updatedData, { new: true });
 
-    // Clear caches for this specific article and trending articles
-    await clearArticleCaches(req.params.id);
+    // Clear ONLY the 2 selective caches (in background)
+    if (redisClient.isReady) {
+      clearSelectiveCaches().catch(err => {
+        console.error('Background cache clearing failed:', err);
+      });
+    }
     
     return res.status(200).json({ success: true, data: updatedArticle });
   } catch (error) {
@@ -190,12 +186,33 @@ const getAllArticles = async (req, res) => {
     // Create a cache key based on all query parameters
     const cacheKey = `articles:all:${page}:${limit}:${sortBy}:${sortOrder}:${search}`;
 
-    // Try to get from cache first
+    // Try to get from cache first (ONLY for this endpoint)
     if (redisClient.isReady) {
       const cachedData = await redisClient.get(cacheKey);
       if (cachedData) {
         console.log('Serving getAllArticles from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
+        const parsedData = JSON.parse(cachedData);
+        
+        // Check if data is more than 1 minute old for first page
+        if (page == 1 && parsedData.cacheTime) {
+          const cacheAge = Date.now() - parsedData.cacheTime;
+          if (cacheAge < 60000) { // 1 minute = 60000 ms
+            return res.status(200).json({
+              success: true,
+              data: parsedData.data,
+              pagination: parsedData.pagination,
+              cached: true
+            });
+          }
+        } else if (page > 1) {
+          // For other pages, use cache normally
+          return res.status(200).json({
+            success: true,
+            data: parsedData.data,
+            pagination: parsedData.pagination,
+            cached: true
+          });
+        }
       }
     }
 
@@ -244,14 +261,20 @@ const getAllArticles = async (req, res) => {
         totalCount,
         totalPages: Math.ceil(totalCount / limit),
       },
+      cacheTime: Date.now() // Add timestamp for age checking
     };
 
-    // Cache the response for 5 minutes
+    // Cache the response for 5 minutes (ONLY for this endpoint)
     if (redisClient.isReady) {
       await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
     }
 
-    res.status(200).json(responseData);
+    res.status(200).json({
+      success: true,
+      data: responseData.data,
+      pagination: responseData.pagination,
+      cached: false
+    });
   } catch (error) {
     console.error('Error retrieving all articles:', error);
     res.status(500).json({ success: false, error: 'An error occurred while retrieving all articles' });
@@ -261,18 +284,8 @@ const getAllArticles = async (req, res) => {
 const getArticleById = async (req, res) => {
   try {
     const articleId = req.params.id;
-    const cacheKey = `article:${articleId}`;
 
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving getArticleById from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
-
-    // Fetch the article by ID and populate related fields
+    // Fetch the article by ID and populate related fields - NO REDIS CACHE
     const article = await Article.findById(articleId)
       .populate('selectedTags', 'name')
       .populate('selectedAuthors', 'firstName lastName')
@@ -301,11 +314,6 @@ const getArticleById = async (req, res) => {
       data: transformedArticle,
     };
 
-    // Cache the response for 10 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 600, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error getting article by ID:', error);
@@ -321,8 +329,12 @@ const deleteArticleById = async (req, res) => {
       return res.status(404).json({ success: false, error: 'Article not found' });
     }
 
-    // Clear caches after deleting article
-    await clearArticleCaches(req.params.id);
+    // Clear ONLY the 2 selective caches (in background)
+    if (redisClient.isReady) {
+      clearSelectiveCaches().catch(err => {
+        console.error('Background cache clearing failed:', err);
+      });
+    }
     
     res.status(200).json({ success: true, data: deletedArticle });
   } catch (error) {
@@ -352,16 +364,6 @@ const getTagsByArticleId = async (req, res) => {
 const getArticleByIdWithMoreViews = async (req, res) => {
   try {
     const articleId = req.params.id;
-    const cacheKey = `article_full:${articleId}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving getArticleByIdWithMoreViews from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     const article = await Article.findById(articleId)
       .populate({
@@ -387,11 +389,6 @@ const getArticleByIdWithMoreViews = async (req, res) => {
     // Increment views when retrieving the article
     await article.incrementViews();
 
-    // Clear cache for this article since views have changed
-    if (redisClient.isReady) {
-      await redisClient.del(`article:${articleId}`);
-    }
-
     const responseData = {
       success: true,
       data: {
@@ -401,11 +398,6 @@ const getArticleByIdWithMoreViews = async (req, res) => {
         category: article.category.name,
       },
     };
-
-    // Cache the response for 5 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
-    }
 
     res.status(200).json(responseData);
   } catch (error) {
@@ -419,12 +411,30 @@ const getTrendingArticles = async (req, res) => {
   try {
     const cacheKey = 'trending_articles';
 
-    // Try to get from cache first
+    // Try to get from cache first (ONLY for this endpoint)
     if (redisClient.isReady) {
       const cachedData = await redisClient.get(cacheKey);
       if (cachedData) {
         console.log('Serving trending articles from Redis cache');
-        return res.status(200).json({ success: true, data: JSON.parse(cachedData), cached: true });
+        const parsedData = JSON.parse(cachedData);
+        
+        // Check if data is more than 1 minute old
+        if (parsedData.cacheTime) {
+          const cacheAge = Date.now() - parsedData.cacheTime;
+          if (cacheAge < 60000) { // 1 minute = 60000 ms
+            return res.status(200).json({ 
+              success: true, 
+              data: parsedData.data, 
+              cached: true 
+            });
+          }
+        } else {
+          return res.status(200).json({ 
+            success: true, 
+            data: parsedData, 
+            cached: true 
+          });
+        }
       }
     }
 
@@ -458,12 +468,21 @@ const getTrendingArticles = async (req, res) => {
         .select('headline subheadline photos youtubeLink views status publishDate');
     }
 
-    // Cache the trending articles for 30 minutes
+    const responseData = {
+      data: trendingArticles,
+      cacheTime: Date.now() // Add timestamp
+    };
+
+    // Cache the trending articles for 1 hour (ONLY for this endpoint)
     if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 1800, JSON.stringify(trendingArticles));
+      await redisClient.setEx(cacheKey, 3600, JSON.stringify(responseData));
     }
 
-    return res.status(200).json({ success: true, data: trendingArticles, cached: false });
+    return res.status(200).json({ 
+      success: true, 
+      data: trendingArticles, 
+      cached: false 
+    });
   } catch (error) {
     console.error('Error getting trending articles:', error);
     return res.status(500).json({ success: false, error: 'Error getting trending articles', details: error.message });
@@ -473,16 +492,6 @@ const getTrendingArticles = async (req, res) => {
 const getAuthorsByArticleId = async (req, res) => {
   try {
     const { articleId } = req.params;
-    const cacheKey = `article_authors:${articleId}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving authors from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
     
     // Find the article by ID
     const article = await Article.findById(articleId);
@@ -498,11 +507,6 @@ const getAuthorsByArticleId = async (req, res) => {
     const authors = await Author.find({ _id: { $in: authorIds } });
 
     const responseData = { success: true, data: authors };
-
-    // Cache for 10 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 600, JSON.stringify(responseData));
-    }
 
     res.status(200).json(responseData);
   } catch (error) {
@@ -521,14 +525,6 @@ const incrementViewsById = async (req, res) => {
 
     await article.incrementViews();
 
-    // Clear cache for this article since views have changed
-    if (redisClient.isReady) {
-      await redisClient.del(`article:${req.params.id}`);
-      await redisClient.del(`article_full:${req.params.id}`);
-      // Also clear trending articles cache since views affect trending
-      await redisClient.del('trending_articles');
-    }
-
     res.status(200).json({ success: true, data: article });
   } catch (error) {
     console.error('Error incrementing views:', error);
@@ -539,16 +535,6 @@ const incrementViewsById = async (req, res) => {
 const getTotalViewsById = async (req, res) => {
   try {
     const articleId = req.params.id;
-    const cacheKey = `article_views:${articleId}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving views from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     const article = await Article.findById(articleId);
 
@@ -557,11 +543,6 @@ const getTotalViewsById = async (req, res) => {
     }
 
     const responseData = { success: true, data: article.views };
-
-    // Cache for 2 minutes (views can change frequently)
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 120, JSON.stringify(responseData));
-    }
 
     res.status(200).json(responseData);
   } catch (error) {
@@ -573,16 +554,6 @@ const getTotalViewsById = async (req, res) => {
 const getShareCountById = async (req, res) => {
   try {
     const articleId = req.params.id;
-    const cacheKey = `article_shares:${articleId}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving share count from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     const article = await Article.findById(articleId);
 
@@ -591,11 +562,6 @@ const getShareCountById = async (req, res) => {
     }
 
     const responseData = { success: true, data: article.shareCount };
-
-    // Cache for 2 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 120, JSON.stringify(responseData));
-    }
 
     res.status(200).json(responseData);
   } catch (error) {
@@ -617,14 +583,6 @@ const updateShareCountById = async (req, res) => {
       return res.status(404).json({ success: false, error: 'Article not found' });
     }
 
-    // Clear cache for this article since share count has changed
-    if (redisClient.isReady) {
-      await redisClient.del(`article:${req.params.id}`);
-      await redisClient.del(`article_shares:${req.params.id}`);
-      // Also clear trending articles cache since shares might affect trending
-      await redisClient.del('trending_articles');
-    }
-
     res.status(200).json({ success: true, data: article.shareCount });
   } catch (error) {
     console.error('Error updating share count:', error);
@@ -634,26 +592,10 @@ const updateShareCountById = async (req, res) => {
 
 const getTotalUniqueLocations = async (req, res) => {
   try {
-    const cacheKey = 'unique_locations';
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving unique locations from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
-
     const articles = await Article.find();
     const uniqueLocations = [...new Set(articles.map(article => article.location))];
     
     const responseData = { success: true, data: uniqueLocations };
-
-    // Cache for 1 hour (locations don't change frequently)
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 3600, JSON.stringify(responseData));
-    }
 
     res.status(200).json(responseData);
   } catch (error) {
@@ -700,18 +642,6 @@ const getArticleByStatus = async (req, res) => {
   try {
     const { status } = req.params;
     const { authorId, categoryId, tagIds, page = 1, limit = 21 } = req.query;
-
-    // Create cache key based on all parameters
-    const cacheKey = `articles_by_status:${status}:${authorId || ''}:${categoryId || ''}:${tagIds || ''}:${page}:${limit}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving articles by status from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     const validStatuses = ['draft', 'scheduled', 'published'];
     if (!validStatuses.includes(status)) {
@@ -770,11 +700,6 @@ const getArticleByStatus = async (req, res) => {
       },
     };
 
-    // Cache for 5 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error fetching articles by filters:', error);
@@ -786,18 +711,6 @@ const getArticlesByCategoryWithStatus = async (req, res) => {
   try {
     const { category, status } = req.params;
     const { page = 1, limit = 12 } = req.query;
-
-    // Create cache key
-    const cacheKey = `articles_by_category_status:${category}:${status}:${page}:${limit}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving articles by category and status from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     // Validate if the category name and status are provided
     if (!category || !status) {
@@ -860,11 +773,6 @@ const getArticlesByCategoryWithStatus = async (req, res) => {
       },
     };
 
-    // Cache for 5 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error getting articles by category and status:', error);
@@ -877,18 +785,6 @@ const getArticlesByCategory = async (req, res) => {
     const categoryName = req.params.category;
     const sortField = req.query.sortField || 'createdAt';
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
-
-    // Create cache key
-    const cacheKey = `articles_by_category:${categoryName}:${sortField}:${sortOrder}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving articles by category from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     // Validate if the category name is provided
     if (!categoryName) {
@@ -934,11 +830,6 @@ const getArticlesByCategory = async (req, res) => {
       })),
     };
 
-    // Cache for 10 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 600, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error getting articles by category:', error);
@@ -950,18 +841,6 @@ const getArticlesByTagWithStatus = async (req, res) => {
   try {
     const { status, tag } = req.params;
     const { page = 1, limit = 9 } = req.query;
-
-    // Create cache key
-    const cacheKey = `articles_by_tag_status:${status}:${tag}:${page}:${limit}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving articles by tag and status from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     if (!status || !tag) {
       console.error('Status and tag are required');
@@ -1032,11 +911,6 @@ const getArticlesByTagWithStatus = async (req, res) => {
       },
     };
 
-    // Cache for 5 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error getting articles by tag and status:', error);
@@ -1048,18 +922,6 @@ const getArticlesByAuthorsWithStatus = async (req, res) => {
   try {
     const { authorName, status } = req.params;
     const { page = 1, limit = 1 } = req.query;
-
-    // Create cache key
-    const cacheKey = `articles_by_author_status:${authorName}:${status}:${page}:${limit}`;
-
-    // Try to get from cache first
-    if (redisClient.isReady) {
-      const cachedData = await redisClient.get(cacheKey);
-      if (cachedData) {
-        console.log('Serving articles by author and status from Redis cache');
-        return res.status(200).json(JSON.parse(cachedData));
-      }
-    }
 
     // Validate status
     const validStatuses = ['draft', 'scheduled', 'published'];
@@ -1139,11 +1001,6 @@ const getArticlesByAuthorsWithStatus = async (req, res) => {
       },
     };
 
-    // Cache for 5 minutes
-    if (redisClient.isReady) {
-      await redisClient.setEx(cacheKey, 300, JSON.stringify(responseData));
-    }
-
     res.status(200).json(responseData);
   } catch (error) {
     console.error('Error getting articles by authors and status:', error);
@@ -1172,6 +1029,6 @@ module.exports = {
   getArticlesByCategoryWithStatus,
   getArticlesByTagWithStatus,
   getArticlesByAuthorsWithStatus,
-  clearArticleCaches, 
+  clearSelectiveCaches, 
   redisClient, 
 };
